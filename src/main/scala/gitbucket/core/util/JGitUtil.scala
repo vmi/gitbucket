@@ -5,6 +5,7 @@ import org.eclipse.jgit.api.Git
 import Directory._
 import StringUtil._
 import ControlUtil._
+
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import org.eclipse.jgit.lib._
@@ -16,9 +17,12 @@ import org.eclipse.jgit.diff.DiffEntry.ChangeType
 import org.eclipse.jgit.errors.{ConfigInvalidException, MissingObjectException}
 import org.eclipse.jgit.transport.RefSpec
 import java.util.Date
-import org.eclipse.jgit.api.errors.{JGitInternalException, InvalidRefNameException, RefAlreadyExistsException, NoHeadException}
+
+import org.eclipse.jgit.api.errors.{InvalidRefNameException, JGitInternalException, NoHeadException, RefAlreadyExistsException}
 import org.eclipse.jgit.dircache.DirCacheEntry
 import org.slf4j.LoggerFactory
+
+import scala.collection.mutable.ListBuffer
 
 /**
  * Provides complex JGit operations.
@@ -211,22 +215,11 @@ object JGitUtil {
    * @return HTML of the file list
    */
   def getFileList(git: Git, revision: String, path: String = "."): List[FileInfo] = {
-    using(new RevWalk(git.getRepository)){ revWalk =>
+    using(new RevWalk(git.getRepository), new TreeWalk(git.getRepository)){ case (revWalk, treeWalk) =>
       val objectId  = git.getRepository.resolve(revision)
       if(objectId == null) return Nil
       val revCommit = revWalk.parseCommit(objectId)
 
-      def useTreeWalk(rev:RevCommit)(f:TreeWalk => Any): Unit = if (path == ".") {
-        val treeWalk = new TreeWalk(git.getRepository)
-        treeWalk.addTree(rev.getTree)
-        using(treeWalk)(f)
-      } else {
-        val treeWalk = TreeWalk.forPath(git.getRepository, path, rev.getTree)
-        if(treeWalk != null){
-          treeWalk.enterSubtree
-          using(treeWalk)(f)
-        }
-      }
       @tailrec
       def simplifyPath(tuple: (ObjectId, FileMode, String, Option[String], RevCommit)): (ObjectId, FileMode, String, Option[String], RevCommit) = tuple match {
         case (oid, FileMode.TREE, name, _, commit ) =>
@@ -245,67 +238,65 @@ object JGitUtil {
         case _ => tuple
       }
 
-      def tupleAdd(tuple:(ObjectId, FileMode, String, Option[String]), rev:RevCommit) = tuple match {
-        case (oid, fmode, name, opt) => (oid, fmode, name, opt, rev)
-      }
-
       @tailrec
-      def findLastCommits(result:List[(ObjectId, FileMode, String, Option[String], RevCommit)],
-                          restList:List[((ObjectId, FileMode, String, Option[String]), Map[RevCommit, RevCommit])],
-                          revIterator:java.util.Iterator[RevCommit]): List[(ObjectId, FileMode, String, Option[String], RevCommit)] ={
-        if(restList.isEmpty){
+      def findLastCommits(result: ListBuffer[(ObjectId, FileMode, String, Option[String], RevCommit)],
+                          fileList: ListBuffer[((ObjectId, FileMode, String, Option[String]), Map[RevCommit, RevCommit])],
+                          revIterator: java.util.Iterator[RevCommit]): ListBuffer[(ObjectId, FileMode, String, Option[String], RevCommit)] ={
+        if(fileList.isEmpty){
           result
         } else if(!revIterator.hasNext){ // maybe, revCommit has only 1 log. other case, restList be empty
-          result ++ restList.map { case (tuple, map) => tupleAdd(tuple, map.values.headOption.getOrElse(revCommit)) }
+          result.appendAll(fileList.map { case ((objectId, fileMode, fileName, linkUrl), map) =>
+            (objectId, fileMode, fileName, linkUrl, map.values.headOption.getOrElse(revCommit))
+          })
+          result
         } else {
           val newCommit = revIterator.next
-          val (thisTimeChecks,skips) = restList.partition { case (tuple, parentsMap) => parentsMap.contains(newCommit) }
-          if(thisTimeChecks.isEmpty){
-            findLastCommits(result, restList, revIterator)
+          val (checks, skips) = fileList.partition { case (_, parentsMap) => parentsMap.contains(newCommit) }
+          if(checks.isEmpty){
+            findLastCommits(result, fileList, revIterator)
           } else {
-            var nextRest = skips
-            var nextResult = result
             // Map[(name, oid), (tuple, parentsMap)]
-            val rest = scala.collection.mutable.Map(thisTimeChecks.map{ t => (t._1._3 -> t._1._1) -> t }:_*)
+            val rest = scala.collection.mutable.Map(checks.map { t => (t._1._3 -> t._1._1) -> t }:_*)
             lazy val newParentsMap = newCommit.getParents.map(_ -> newCommit).toMap
-            useTreeWalk(newCommit){ walk =>
-              while(walk.next){
-                rest.remove(walk.getNameString -> walk.getObjectId(0)).map { case (tuple, _) =>
-                  if(newParentsMap.isEmpty){
-                    nextResult +:= tupleAdd(tuple, newCommit)
-                  } else {
-                    nextRest +:= tuple -> newParentsMap
-                  }
+
+            treeWalk.reset(newCommit.getTree)
+            while(treeWalk.next){
+              rest.remove(treeWalk.getNameString -> treeWalk.getObjectId(0)).map { case ((objectId, fileMode, fileName, linkUrl), _) =>
+                if(newParentsMap.isEmpty){
+                  result.append((objectId, fileMode, fileName, linkUrl, newCommit))
+                } else {
+                  skips.append((objectId, fileMode, fileName, linkUrl) -> newParentsMap)
                 }
               }
             }
-            rest.values.map { case (tuple, parentsMap) =>
+            rest.values.map { case ((objectId, fileMode, fileName, linkUrl), parentsMap) =>
               val restParentsMap = parentsMap - newCommit
               if(restParentsMap.isEmpty){
-                nextResult +:= tupleAdd(tuple, parentsMap(newCommit))
+                result.append((objectId, fileMode, fileName, linkUrl, parentsMap(newCommit)))
               } else {
-                nextRest +:= tuple -> restParentsMap
+                skips.append((objectId, fileMode, fileName, linkUrl) -> restParentsMap)
               }
             }
-            findLastCommits(nextResult, nextRest, revIterator)
+            findLastCommits(result, skips, revIterator)
           }
         }
       }
 
-      var fileList: List[(ObjectId, FileMode, String, Option[String])] = Nil
-      useTreeWalk(revCommit){ treeWalk =>
-        while (treeWalk.next()) {
-          val linkUrl = if (treeWalk.getFileMode(0) == FileMode.GITLINK) {
-            getSubmodules(git, revCommit.getTree).find(_.path == treeWalk.getPathString).map(_.url)
-          } else None
-          fileList +:= (treeWalk.getObjectId(0), treeWalk.getFileMode(0), treeWalk.getNameString, linkUrl)
-        }
+      val fileList = new ListBuffer[(ObjectId, FileMode, String, Option[String])]()
+      treeWalk.reset(revCommit.getTree)
+      while (treeWalk.next()) {
+        val linkUrl = if (treeWalk.getFileMode(0) == FileMode.GITLINK) {
+          getSubmodules(git, revCommit.getTree).find(_.path == treeWalk.getPathString).map(_.url)
+        } else None
+        fileList.append((treeWalk.getObjectId(0), treeWalk.getFileMode(0), treeWalk.getNameString, linkUrl))
       }
+
       revWalk.markStart(revCommit)
       val it = revWalk.iterator
       val lastCommit = it.next
       val nextParentsMap = Option(lastCommit).map(_.getParents.map(_ -> lastCommit).toMap).getOrElse(Map())
-      findLastCommits(List.empty, fileList.map(a => a -> nextParentsMap), it)
+
+      findLastCommits(new ListBuffer[(ObjectId, FileMode, String, Option[String], RevCommit)](), fileList.map(_ -> nextParentsMap), it)
         .map(simplifyPath)
         .map { case (objectId, fileMode, name, linkUrl, commit) =>
           FileInfo(

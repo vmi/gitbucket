@@ -24,32 +24,61 @@ import com.github.zafarkhaja.semver.{Version => Semver}
 import scala.collection.JavaConverters._
 import scala.concurrent.Await
 import scala.concurrent.duration._
+import scala.concurrent.Channel
 
 /**
- * Initialize GitBucket system.
- * Update database schema and load plug-ins automatically in the context initializing.
- */
+  * Initialize GitBucket system.
+  * Update database schema and load plug-ins automatically in the context initializing.
+  */
 class InitializeListener extends ServletContextListener with SystemSettingsService {
 
   private val logger = LoggerFactory.getLogger(classOf[InitializeListener])
 
-  // ActorSystem for Quartz scheduler
-  private val system = ActorSystem(
-    "job",
-    ConfigFactory.parseString("""
-      |akka {
-      |  daemonic = on
-      |  coordinated-shutdown.run-by-jvm-shutdown-hook = off
-      |  quartz {
-      |    schedules {
-      |      Daily {
-      |        expression = "0 0 0 * * ?"
-      |      }
-      |    }
-      |  }
-      |}
-    """.stripMargin)
-  )
+  sealed trait Command
+
+  case object StartScheduler extends Command
+
+  case object Shutdown extends Command
+
+  private val channel = new Channel[Command]
+
+  class Scheduler extends Runnable {
+    override def run(): Unit = {
+      // ActorSystem for Quartz scheduler
+      val system = ActorSystem("job", ConfigFactory.parseString(
+        """
+          |akka {
+          |  daemonic = on
+          |  coordinated-shutdown.run-by-jvm-shutdown-hook = off
+          |  quartz {
+          |    schedules {
+          |      Daily {
+          |        expression = "0 0 0 * * ?"
+          |      }
+          |    }
+          |  }
+          |}
+        """.stripMargin))
+      var scheduler: Option[QuartzSchedulerExtension] = None
+      while (channel.read match {
+        case StartScheduler => {
+          scheduler = Some(QuartzSchedulerExtension(system))
+          scheduler foreach { s =>
+            s.schedule("Daily", system.actorOf(Props[DeleteOldActivityActor]), "DeleteOldActivity")
+          }
+          true
+        }
+        case Shutdown => false
+      }) {
+        // no operation.
+      }
+      scheduler.foreach { s => s.shutdown() }
+      Await.result(system.terminate(), 3.seconds)
+    }
+  }
+
+  private val schedulerThread = new Thread(new Scheduler)
+  schedulerThread.start()
 
   override def contextInitialized(event: ServletContextEvent): Unit = {
     val dataDir = event.getServletContext.getInitParameter("gitbucket.home")
@@ -80,9 +109,7 @@ class InitializeListener extends ServletContextListener with SystemSettingsServi
 
       val gitbucketVersion = GitBucketCoreModule.getVersions.asScala.last.getVersion
       if (databaseVersion != gitbucketVersion) {
-        throw new IllegalStateException(
-          s"Initialization failed. GitBucket version is ${gitbucketVersion}, but database version is ${databaseVersion}."
-        )
+        throw new IllegalStateException(s"Initialization failed. GitBucket version is ${gitbucketVersion}, but database version is ${databaseVersion}.")
       }
 
       // Install bundled plugins
@@ -94,9 +121,7 @@ class InitializeListener extends ServletContextListener with SystemSettingsServi
     }
 
     // Start Quartz scheduler
-    val scheduler = QuartzSchedulerExtension(system)
-
-    scheduler.schedule("Daily", system.actorOf(Props[DeleteOldActivityActor]), "DeleteOldActivity")
+    channel.write(StartScheduler)
   }
 
   private def checkVersion(manager: JDBCVersionManager, conn: java.sql.Connection): Unit = {
@@ -149,27 +174,17 @@ class InitializeListener extends ServletContextListener with SystemSettingsServi
 
           val plugins = PluginRepository.parsePluginJson(pluginsJson)
           plugins.foreach { plugin =>
-            plugin.versions
-              .sortBy { x =>
-                Semver.valueOf(x.version)
-              }
-              .reverse
-              .zipWithIndex
-              .foreach {
-                case (version, i) =>
-                  val file = new File(PluginRepository.LocalRepositoryDir, version.file)
-                  if (!file.exists) {
-                    logger.info(s"Copy ${plugin} to ${file.getAbsolutePath}")
-                    FileUtils.forceMkdirParent(file)
-                    using(cl.getResourceAsStream("plugins/" + version.file), new FileOutputStream(file)) {
-                      case (in, out) => IOUtils.copy(in, out)
-                    }
+            plugin.versions.sortBy { x => Semver.valueOf(x.version) }.reverse.zipWithIndex.foreach { case (version, i) =>
+              val file = new File(PluginRepository.LocalRepositoryDir, version.file)
+              if (!file.exists) {
+                logger.info(s"Copy ${plugin} to ${file.getAbsolutePath}")
+                FileUtils.forceMkdirParent(file)
+                using(cl.getResourceAsStream("plugins/" + version.file), new FileOutputStream(file)) { case (in, out) => IOUtils.copy(in, out) }
 
-                    if (plugin.default && i == 0) {
-                      logger.info(s"Enable ${file.getName} in default")
-                      FileUtils.copyFile(file, new File(PluginHome, version.file))
-                    }
-                  }
+                if (plugin.default && i == 0) {
+                  logger.info(s"Enable ${file.getName} in default")
+                  FileUtils.copyFile(file, new File(PluginHome, version.file))
+                }
               }
           }
         }
@@ -181,7 +196,12 @@ class InitializeListener extends ServletContextListener with SystemSettingsServi
 
   override def contextDestroyed(event: ServletContextEvent): Unit = {
     // Shutdown Quartz scheduler
-    Await.result(system.terminate(), 3.seconds)
+    channel.write(Shutdown)
+    try {
+      schedulerThread.join()
+    } catch {
+      case e: InterruptedException => {}
+    }
     // Shutdown plugins
     PluginRegistry.shutdown(event.getServletContext, loadSystemSettings())
     // Close datasource

@@ -1,14 +1,18 @@
 package gitbucket.core.servlet
 
+import java.sql.DriverManager
+
 import javax.servlet._
 import javax.servlet.http.HttpServletRequest
 import com.zaxxer.hikari._
 import gitbucket.core.util.DatabaseConfig
 import org.scalatra.ScalatraBase
 import org.slf4j.LoggerFactory
-import slick.jdbc.JdbcBackend.{Database => SlickDatabase, Session}
+import slick.jdbc.JdbcBackend.{Session, Database => SlickDatabase}
 import gitbucket.core.util.Keys
 import gitbucket.core.model.Profile.profile.blockingApi._
+
+import scala.collection.JavaConverters.enumerationAsScalaIteratorConverter
 
 /**
  * Controls the transaction with the open session in view pattern.
@@ -76,4 +80,16 @@ object Database {
 
   def closeDataSource(): Unit = dataSource.close
 
+  def deregisterDriver(): Unit = {
+    Option(Thread.currentThread().getContextClassLoader).foreach { contextClassLoader =>
+      val className = dataSource.getDriverClassName
+      DriverManager.getDrivers().asScala.foreach { driver =>
+        val c = driver.getClass
+        if (c.getCanonicalName == className && c.getClassLoader == contextClassLoader) {
+          DriverManager.deregisterDriver(driver)
+          System.err.println(s"Deregister driver: ${driver}")
+        }
+      }
+    }
+  }
 }

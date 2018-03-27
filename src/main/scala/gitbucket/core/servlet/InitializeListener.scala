@@ -15,7 +15,6 @@ import gitbucket.core.model.Profile.profile.blockingApi._
 import io.github.gitbucket.solidbase.Solidbase
 import io.github.gitbucket.solidbase.manager.JDBCVersionManager
 import javax.servlet.{ServletContextEvent, ServletContextListener}
-
 import org.apache.commons.io.{FileUtils, IOUtils}
 import org.slf4j.LoggerFactory
 import akka.actor.{Actor, ActorSystem, Props}
@@ -187,6 +186,7 @@ class InitializeListener extends ServletContextListener with SystemSettingsServi
     PluginRegistry.shutdown(event.getServletContext, loadSystemSettings())
     // Close datasource
     Database.closeDataSource()
+    Database.deregisterDriver()
   }
 
 }

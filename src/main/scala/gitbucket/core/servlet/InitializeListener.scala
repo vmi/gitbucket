@@ -23,6 +23,8 @@ import com.typesafe.akka.extension.quartz.QuartzSchedulerExtension
 import com.github.zafarkhaja.semver.{Version => Semver}
 
 import scala.collection.JavaConverters._
+import scala.concurrent.Await
+import scala.concurrent.duration._
 
 /**
  * Initialize GitBucket system.
@@ -180,7 +182,7 @@ class InitializeListener extends ServletContextListener with SystemSettingsServi
 
   override def contextDestroyed(event: ServletContextEvent): Unit = {
     // Shutdown Quartz scheduler
-    system.terminate()
+    Await.result(system.terminate(), 3.seconds)
     // Shutdown plugins
     PluginRegistry.shutdown(event.getServletContext, loadSystemSettings())
     // Close datasource

@@ -355,10 +355,12 @@ object PluginRegistry {
         plugin.pluginClass.shutdown(instance, context, settings)
         if (watcher != null) {
           watcher.interrupt()
+          watcher.join()
           watcher = null
         }
         if (extraWatcher != null) {
           extraWatcher.interrupt()
+          extraWatcher.join()
           extraWatcher = null
         }
       } catch {
